@@ -15,6 +15,7 @@ AWAY_FORWARD_NUMBER = "+916267187671"
 
 WHATSAPP_CONTACTS: Dict[str, str] = {}
 SEEN_ALERT_SIGNATURES: Set[str] = set()
+CONTACT_CACHE: Dict[str, str] = {}
 SELF_DIALED_NUMBERS: Set[str] = set()
 IS_NEMESIS_CALLING: bool = False
 NEMESIS_COOLDOWN_UNTIL: float = 0.0
@@ -117,47 +118,50 @@ class AndroidSwarmBridge:
         return cls._run_adb_sync(serial, ["shell", "cat /sdcard/nemesis_ui.xml"])
 
     @classmethod
-    def _lookup_contact_number_sync(cls, serial: str, name_query: str) -> str:
-        clean_q = name_query.strip().lower()
-        if not clean_q:
-            return ""
-        if clean_q in WHATSAPP_CONTACTS and WHATSAPP_CONTACTS[clean_q]:
-            return re.sub(r"\D", "", WHATSAPP_CONTACTS[clean_q])
+    def _lookup_contact_number_sync(cls, serial: str, name_or_number: str) -> Optional[str]:
+        """Resolves a contact name to a +91 phone number using instant cache + case-insensitive ADB dump."""
+        raw_target = (name_or_number or "").strip()
+        if not raw_target:
+            return None
 
-        digits_only = re.sub(r"\D", "", clean_q)
+        # If already a phone number, normalize directly
+        digits_only = re.sub(r"\D", "", raw_target)
         if len(digits_only) >= 10:
-            return "91" + digits_only if len(digits_only) == 10 else digits_only
+            return f"91{digits_only[-10:]}"
 
-        raw = cls._run_adb_sync(
+        cache_key = raw_target.lower()
+        if cache_key in CONTACT_CACHE:
+            return CONTACT_CACHE[cache_key]
+
+        out = cls._run_adb_sync(
             serial,
             ["shell", "content query --uri content://com.android.contacts/data/phones --projection display_name:data1"],
             timeout=10,
         )
-        if not raw or "Error" in raw:
-            return ""
+        if not out or "Error" in out:
+            return None
 
-        exact_match = ""
-        partial_match = ""
-        for line in raw.splitlines():
-            m = re.search(r"display_name=([^,]+),\s*data1=(.+)$", line)
-            if not m:
+        best_partial: Optional[str] = None
+        for line in out.splitlines():
+            m_name = re.search(r"display_name=([^,]+)", line)
+            m_num = re.search(r"data1=([^\s,]+)", line)
+            if not (m_name and m_num):
                 continue
-            disp = m.group(1).strip().lower()
-            num = re.sub(r"\D", "", m.group(2))
-            if len(num) < 10:
+            disp = m_name.group(1).strip().lower()
+            num_digits = re.sub(r"\D", "", m_num.group(1))
+            if len(num_digits) < 10:
                 continue
-            if len(num) == 11 and num.startswith("0"):
-                num = "91" + num[1:]
-            elif len(num) == 10:
-                num = "91" + num
+            normalized = f"91{num_digits[-10:]}"
+            CONTACT_CACHE[disp] = normalized
 
-            if disp == clean_q:
-                exact_match = num
-                break
-            elif clean_q in disp and not partial_match:
-                partial_match = num
+            if disp == cache_key:
+                return normalized
+            if cache_key in disp or disp in cache_key:
+                best_partial = normalized
 
-        return exact_match or partial_match
+        if best_partial:
+            CONTACT_CACHE[cache_key] = best_partial
+        return best_partial
 
     @classmethod
     def _tap_ui_node_sync(cls, serial: str, resource_keywords: List[str], desc_keywords: List[str]) -> bool:
@@ -580,7 +584,7 @@ class AndroidSwarmBridge:
 
             mx, my = mic_coords
             adb_bin = cls.get_adb_path()
-            clean_speech = re.sub(r"[^a-zA-Z0-9,.?!\s]", "", spoken_message).strip() or "Hello, I am busy right now."
+            clean_speech = re.sub(r"[^a-zA-Z0-9,.?!\s]", " ", spoken_message.replace("'", "")).strip() or "Hello, I am busy right now."
 
             # Calculate hold duration so the mic stays pressed for the entire spoken sentence + 2.2s buffer
             word_count = len(clean_speech.split())
@@ -691,7 +695,7 @@ class AndroidSwarmBridge:
 
             # Wait 9 seconds for pickup, speak natural assistant message, then hang up
             if spoken_message and spoken_message.strip():
-                clean_speech = re.sub(r"[^a-zA-Z0-9,.?!\s]", "", spoken_message).strip()
+                clean_speech = re.sub(r"[^a-zA-Z0-9,.?!\s]", " ", spoken_message.replace("'", "")).strip()
                 if clean_speech:
                     time.sleep(9.0)
                     ps_script = (
