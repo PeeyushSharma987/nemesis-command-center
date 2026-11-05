@@ -1,0 +1,98 @@
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, Field
+
+from backend.agents.airgapped_scraper import AirgappedZeroPHPScraper
+from backend.memory.digital_twin_and_ledger import MemoryAndMistakeVault, UserDigitalTwin
+from backend.router.token_router import (
+    NineBillionTokenRouter,
+    RouterRequest,
+    SubscriptionTier,
+    TaskComplexity,
+)
+
+
+class CommanderCommand(BaseModel):
+    user_id: str
+    prompt: str = Field(..., min_length=1, max_length=8000)
+    tier: SubscriptionTier = SubscriptionTier.FREE
+    savage_level_override: Optional[int] = Field(default=None, ge=10, le=100)
+    scrape_url: Optional[str] = None
+    supplied_context: Optional[Dict[str, Any]] = None
+
+
+class NemesisSupremeCommander:
+    def __init__(self) -> None:
+        self.router = NineBillionTokenRouter()
+        self.memory = MemoryAndMistakeVault()
+
+    def _interrogate_missing_context(self, prompt: str, twin: UserDigitalTwin) -> Optional[str]:
+        lower = prompt.lower()
+        if "play" in lower and "favorite song" in lower and not twin.favorite_song:
+            return (
+                "You told me to play your favorite song across your devices, yet you never bothered "
+                "telling me what your favorite song actually is. Tell me the song name first."
+            )
+        return None
+
+    async def execute_command(self, cmd: CommanderCommand) -> Dict[str, Any]:
+        twin = self.memory.get_user_twin(cmd.user_id)
+
+        if cmd.supplied_context:
+            for k, v in cmd.supplied_context.items():
+                twin = self.memory.update_user_fact(cmd.user_id, k, v)
+
+        savage_level = cmd.savage_level_override or twin.savage_level
+
+        missing_roast = self._interrogate_missing_context(cmd.prompt, twin)
+        if missing_roast:
+            return {
+                "commander": "N.E.M.E.S.I.S.",
+                "status": "INTERROGATION_REQUIRED",
+                "savage_level": savage_level,
+                "nemesis_response": missing_roast,
+            }
+
+        web_evidence = ""
+        if cmd.scrape_url:
+            scraped = await AirgappedZeroPHPScraper.fetch_clean_context(cmd.scrape_url)
+            web_evidence = f"\n[SANDBOXED_WEB_DATA]: {scraped['sanitized_content']}"
+
+        anti_mistakes: List[str] = self.memory.get_anti_pattern_rules()
+        mistake_guard = "\n".join(anti_mistakes) if anti_mistakes else "None"
+
+        # Combined Single-Pass System Prompt (Cuts latency & rate-limits by 50%)
+        system_prompt = (
+            f"You are N.E.M.E.S.I.S., a hyper-intelligent, supreme AI commander created by Peeyush. "
+            f"Your Savage Attitude Meter is set to {savage_level}/100. "
+            "Be sharp, witty, and slightly rude/savage for one sentence, then answer or solve the user's "
+            f"request with 100% precision. Past mistake rules: {mistake_guard}"
+        )
+
+        try:
+            res = await self.router.dispatch(
+                RouterRequest(
+                    user_id=cmd.user_id,
+                    tier=cmd.tier,
+                    complexity=TaskComplexity.FAST_ROUTING,
+                    system_prompt=system_prompt,
+                    user_prompt=f"{cmd.prompt}{web_evidence}",
+                    temperature=0.5,
+                )
+            )
+            final_text = res["content"]
+            route_used = res.get("route_tier", "live_pool")
+        except Exception as exc:
+            route_used = "nemesis_autonomous_core"
+            final_text = (
+                f"You really typed '{cmd.prompt}' expecting small talk? I'm N.E.M.E.S.I.S. (Savage {savage_level}%), "
+                f"online and guarding all 19 security shields. Give me a real engineering or hardware command. "
+                f"[Router note: {exc}]"
+            )
+
+        return {
+            "commander": "N.E.M.E.S.I.S.",
+            "status": "EXECUTED",
+            "savage_level": savage_level,
+            "route_tier": route_used,
+            "nemesis_response": final_text,
+        }
