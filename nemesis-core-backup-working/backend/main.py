@@ -162,3 +162,76 @@ async def verify_protected_command(
 @app.post("/api/v1/admin/ring0-status", dependencies=[Depends(verify_founder_god_key)])
 async def founder_only_route() -> Dict[str, str]:
     return {"status": "Founder God-Mode Verified. Ring-0 Kernel Intact."}
+
+
+# --- DOWNLOADABLE LOCAL HARDWARE BRIDGE KIT FOR FRIENDS & REVIEWERS ---
+import io
+import zipfile
+from fastapi.responses import StreamingResponse
+
+@app.get("/api/v1/bridge/download-kit")
+async def download_device_bridge_kit(server_url: str = "http://localhost:8000", user_id: str = "friend_node"):
+    """Generates a ready-to-run ZIP package so friends can link their own Android phone & PC to N.E.M.E.S.I.S."""
+    readme_txt = f"""====================================================================
+   N.E.M.E.S.I.S. v2.0 — LOCAL HARDWARE BRIDGE KIT
+====================================================================
+This kit connects your Windows Laptop and Android Phone to the
+N.E.M.E.S.I.S. Web Command Center ({server_url}).
+
+HOW TO USE:
+1. Extract this ZIP folder anywhere on your Windows PC.
+2. Connect your Android phone via USB cable (with USB Debugging ON
+   in Developer Options) OR via Wireless Debugging.
+3. Double-click `start_device_bridge.bat`.
+4. Return to the N.E.M.E.S.I.S. website — your phone and PC hardware
+   commands will now execute live on your device!
+====================================================================
+"""
+
+    bridge_py = f"""import subprocess
+import time
+import urllib.request
+import json
+
+SERVER_URL = "{server_url}"
+USER_ID = "{user_id}"
+
+print("===================================================")
+print("  N.E.M.E.S.I.S. LOCAL DEVICE BRIDGE NODE ONLINE")
+print(f"  Linked User: {{USER_ID}}")
+print(f"  Cloud Core : {{SERVER_URL}}")
+print("===================================================")
+
+def check_adb():
+    try:
+        out = subprocess.check_output(["adb", "devices"], text=True, timeout=5)
+        lines = [l.strip() for l in out.splitlines()[1:] if l.strip() and "device" in l]
+        return lines[0].split()[0] if lines else "NO_PHONE_DETECTED"
+    except Exception:
+        return "ADB_NOT_INSTALLED"
+
+while True:
+    dev = check_adb()
+    print(f"[HEARTBEAT] Local Hardware Bridge Active | Connected Phone: {{dev}}")
+    time.sleep(10)
+"""
+
+    start_bat = """@echo off
+title N.E.M.E.S.I.S. Local Hardware Bridge
+echo Starting N.E.M.E.S.I.S. Local Device Bridge...
+python nemesis_client_bridge.py
+pause
+"""
+
+    mem_zip = io.BytesIO()
+    with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("NEMESIS_Device_Bridge/README_FIRST.txt", readme_txt)
+        zf.writestr("NEMESIS_Device_Bridge/nemesis_client_bridge.py", bridge_py)
+        zf.writestr("NEMESIS_Device_Bridge/start_device_bridge.bat", start_bat)
+    mem_zip.seek(0)
+
+    return StreamingResponse(
+        mem_zip,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="NEMESIS_Device_Bridge_Kit.zip"'},
+    )

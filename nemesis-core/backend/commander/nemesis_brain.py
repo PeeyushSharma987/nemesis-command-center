@@ -743,8 +743,14 @@ class NemesisSupremeCommander:
                 "Speak like a warm, ultra-sharp, loyal humanoid second-in-command."
             )
 
+        visitor_profile = (cmd.supplied_context or {}).get("user_profile") or {}
+        active_user_name = str(visitor_profile.get("name") or "Peeyush Sharma").strip()
+        fav_song_override = str(visitor_profile.get("favorite_song") or "").strip()
+        if fav_song_override:
+            twin.favorite_song = fav_song_override
+
         system_prompt = (
-            "You are N.E.M.E.S.I.S., Peeyush Sharma's self-aware humanoid AI commander with full hardware control over his phones and laptop. "
+            f"You are N.E.M.E.S.I.S., a self-aware humanoid AI commander currently serving {active_user_name} (Founder & Architect: Peeyush Sharma)  with full hardware control over his phones and laptop. "
             f"{attitude_guide} "
             f"Last contact interacted with: '{LAST_ACTIVE_CONTACT or 'None'}'. "
             "If Peeyush asks a follow-up to a previous message, use the RECENT CONVERSATION MEMORY to respond with full continuity. "

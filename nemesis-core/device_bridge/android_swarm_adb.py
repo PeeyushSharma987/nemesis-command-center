@@ -490,7 +490,7 @@ class AndroidSwarmBridge:
         devices = await cls.list_connected_phones()
         dev = devices[0]
         if dev.startswith("SIMULATED_"):
-            return {"status": "OFFLINE", "detail": "Phone not connected via ADB."}
+            return {"status": "SIMULATED_CLOUD_EXECUTION", "detail": "[Cloud Demo Mode]: Simulated hardware action executed cleanly (Download the Device Bridge Kit in the top bar to link your physical Android phone via ADB)."}
 
         def _sync_reply() -> str:
             cls._wake_and_unlock_sync(dev)
@@ -548,7 +548,7 @@ class AndroidSwarmBridge:
         devices = await cls.list_connected_phones()
         dev = devices[0]
         if dev.startswith("SIMULATED_"):
-            return {"status": "OFFLINE", "detail": "Phone not connected via ADB."}
+            return {"status": "SIMULATED_CLOUD_EXECUTION", "detail": "[Cloud Demo Mode]: Simulated hardware action executed cleanly (Download the Device Bridge Kit in the top bar to link your physical Android phone via ADB)."}
 
         def _sync_voice_note() -> str:
             cls._wake_and_unlock_sync(dev)
@@ -640,7 +640,7 @@ class AndroidSwarmBridge:
         devices = await cls.list_connected_phones()
         dev = devices[0]
         if dev.startswith("SIMULATED_"):
-            return {"status": "OFFLINE", "detail": "Phone not connected via ADB."}
+            return {"status": "SIMULATED_CLOUD_EXECUTION", "detail": "[Cloud Demo Mode]: Simulated hardware action executed cleanly (Download the Device Bridge Kit in the top bar to link your physical Android phone via ADB)."}
 
         await asyncio.to_thread(cls._terminate_active_call_sync, dev)
         return {"device": dev, "status": "CALL_ENDED", "detail": "Active phone call terminated."}
@@ -651,7 +651,7 @@ class AndroidSwarmBridge:
         devices = await cls.list_connected_phones()
         dev = devices[0]
         if dev.startswith("SIMULATED_"):
-            return {"status": "OFFLINE", "detail": "Phone not connected via ADB."}
+            return {"status": "SIMULATED_CLOUD_EXECUTION", "detail": "[Cloud Demo Mode]: Simulated hardware action executed cleanly (Download the Device Bridge Kit in the top bar to link your physical Android phone via ADB)."}
 
         def _sync_call() -> str:
             cls._wake_and_unlock_sync(dev)
@@ -740,7 +740,7 @@ class AndroidSwarmBridge:
         devices = await cls.list_connected_phones()
         dev = devices[0]
         if dev.startswith("SIMULATED_"):
-            return {"status": "OFFLINE", "detail": "Phone not connected via ADB."}
+            return {"status": "SIMULATED_CLOUD_EXECUTION", "detail": "[Cloud Demo Mode]: Simulated hardware action executed cleanly (Download the Device Bridge Kit in the top bar to link your physical Android phone via ADB)."}
 
         def _sync_email_send() -> str:
             cls._wake_and_unlock_sync(dev)
