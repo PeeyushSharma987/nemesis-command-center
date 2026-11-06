@@ -1,0 +1,6 @@
+﻿__pycache__/
+*.pyc
+.env
+cloudflared.exe
+nemesis-core/platform-tools/
+nemesis-core-backup-working/

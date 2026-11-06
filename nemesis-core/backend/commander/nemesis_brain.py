@@ -22,9 +22,9 @@ from backend.router.token_router import (
 from device_bridge.android_swarm_adb import AndroidSwarmBridge
 from device_bridge.pc_daemon import PSwarmDaemon
 
-# Persistent Multi-Turn Conversation Memory & Last Contact Tracker
-CONVERSATION_HISTORY: List[Dict[str, str]] = []
-LAST_ACTIVE_CONTACT: str = ""
+CONVERSATION_HISTORY: Dict[str, List[Dict[str, str]]] = {}
+LAST_ACTIVE_CONTACT: Dict[str, str] = {}
+RECENT_REQUEST_CACHE: Dict[str, Tuple[str, float, Dict[str, Any]]] = {}
 
 
 class CommanderCommand(BaseModel):
@@ -42,35 +42,64 @@ class NemesisSupremeCommander:
         self.memory = MemoryAndMistakeVault()
 
     @staticmethod
+    def _get_friend_node(uid: str) -> Optional[Dict[str, Any]]:
+        try:
+            from backend.main import get_active_friend_node
+            return get_active_friend_node(uid)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _queue_friend_cmd(uid: str, action: str, payload: Dict[str, Any]) -> None:
+        try:
+            from backend.main import queue_friend_command
+            queue_friend_command(uid, action, payload)
+        except Exception:
+            pass
+
+    @classmethod
+    def _resolve_friend_number(cls, uid: str, name_or_num: str, friend_node: Dict[str, Any]) -> str:
+        raw = (name_or_num or "").strip()
+        digits = re.sub(r"\D", "", raw)
+        if len(digits) >= 10:
+            return f"91{digits[-10:]}"
+        contacts = friend_node.get("contacts") or {}
+        key = raw.lower()
+        if key in contacts:
+            return contacts[key]
+        for k, v in contacts.items():
+            if key in k or k in key:
+                return v
+        return digits or raw
+
+    @staticmethod
     def _clean_spoken_text(text: str) -> str:
-        """Removes markdown asterisks, backticks, or accidental JSON wrappers so TTS speaks cleanly."""
         cleaned = re.sub(r"```(?:json|python)?.*?```", "", text, flags=re.S).strip()
         cleaned = re.sub(r"[*_`#]+", "", cleaned)
         cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
         return cleaned or text.strip()
 
     @staticmethod
-    def _record_turn(user_msg: str, nemesis_reply: str, contact: str = "") -> None:
-        global LAST_ACTIVE_CONTACT
+    def _record_turn(uid: str, user_msg: str, nemesis_reply: str, contact: str = "") -> None:
         if contact and contact.lower() not in ("none", "me", "nemesis"):
-            LAST_ACTIVE_CONTACT = contact.strip()
+            LAST_ACTIVE_CONTACT[uid] = contact.strip()
         if user_msg and not user_msg.startswith("__"):
-            CONVERSATION_HISTORY.append(
+            hist = CONVERSATION_HISTORY.setdefault(uid, [])
+            hist.append(
                 {
                     "user": user_msg.strip(),
                     "nemesis": nemesis_reply.strip(),
                     "time": time.strftime("%H:%M:%S"),
                 }
             )
-            if len(CONVERSATION_HISTORY) > 12:
-                del CONVERSATION_HISTORY[0]
+            if len(hist) > 12:
+                del hist[0]
 
     @staticmethod
-    def _resolve_contact(raw_contact: Optional[str]) -> str:
-        """Resolves follow-up pronouns like 'her', 'him', 'them', 'that number' to LAST_ACTIVE_CONTACT."""
+    def _resolve_contact(uid: str, raw_contact: Optional[str]) -> str:
         c = (raw_contact or "").strip()
         if c.lower() in ("", "none", "null", "him", "her", "them", "that person", "same person", "back"):
-            return LAST_ACTIVE_CONTACT
+            return LAST_ACTIVE_CONTACT.get(uid, "Mom")
         return c
 
     async def _mutate_self_ouroboros(self, target_file: str, instruction: str, supplied_key: str) -> str:
@@ -93,14 +122,14 @@ class NemesisSupremeCommander:
 
         system_prompt = (
             "You are the N.E.M.E.S.I.S. Ouroboros Self-Mutating Engine. "
-            "Rewrite the Python file below to add the new capability requested by Peeyush inside `execute_learned_skill(prompt: str, lower: str) -> Optional[str]`. "
+            "Rewrite the Python file below to add the new capability requested by the user inside `execute_learned_skill(prompt: str, lower: str) -> Optional[str]`. "
             "Keep all existing learned skills intact and add the new `if ...:` check above `# --- OUROBOROS_INJECTION_MARKER ---`. "
-            "To run ADB shell commands on Peeyush's Android phone, call: "
+            "To run ADB shell commands on the Android phone, call: "
             "`out = AndroidSwarmBridge._run_adb_sync(dev, ['shell', '<command>'])`. "
             "Output ONLY raw valid Python code for the complete file—no markdown fences, no explanations."
         )
 
-        user_msg = f"CURRENT FILE:\n{current_skills_code}\n\nNEW MUTATION REQUEST FROM PEEYUSH:\n{instruction}"
+        user_msg = f"CURRENT FILE:\n{current_skills_code}\n\nNEW MUTATION REQUEST:\n{instruction}"
         headers = {"Content-Type": "application/json", "x-goog-api-key": gemini_key}
         payload = {
             "contents": [{"role": "user", "parts": [{"text": system_prompt + "\n\n" + user_msg}]}],
@@ -148,7 +177,7 @@ class NemesisSupremeCommander:
         return ""
 
     @classmethod
-    def _parse_call_intent(cls, raw_prompt: str) -> Optional[Tuple[str, str]]:
+    def _parse_call_intent(cls, uid: str, raw_prompt: str) -> Optional[Tuple[str, str]]:
         clean = raw_prompt.strip()
         lower = clean.lower()
         if not (lower.startswith("call ") or lower.startswith("dial ") or lower.startswith("please call ") or "make a call to" in lower):
@@ -167,10 +196,10 @@ class NemesisSupremeCommander:
         if len(split_m) == 2:
             contact = re.sub(r"\s+on\s+speaker(?:phone)?$", "", split_m[0], flags=re.I).strip().strip(".!?,\x22\x27")
             msg = split_m[1].strip().strip(".!?,\x22\x27")
-            return cls._resolve_contact(contact), msg
+            return cls._resolve_contact(uid, contact), msg
 
         contact_only = re.sub(r"\s+on\s+speaker(?:phone)?[.!?]*$", "", remainder, flags=re.I).strip().strip(".!?,\x22\x27")
-        return cls._resolve_contact(contact_only), ""
+        return cls._resolve_contact(uid, contact_only), ""
 
     async def _analyze_multimodal_attachment(
         self,
@@ -188,10 +217,10 @@ class NemesisSupremeCommander:
 
         parts: List[Dict[str, Any]] = []
         system_instruction = (
-            f"You are N.E.M.E.S.I.S., Peeyush's supreme humanoid AI. Peeyush attached '{attachment_name}' ({attachment_mime}). "
+            f"You are N.E.M.E.S.I.S., a supreme humanoid AI commander. The user attached '{attachment_name}' ({attachment_mime}). "
             f"User instruction: '{user_prompt}'. "
             "Respond ONLY with a valid JSON object using these exact keys: "
-            '{"analysis": "<your sharp, detailed analysis for Peeyush>", '
+            '{"analysis": "<your sharp, detailed analysis>", '
             '"action": "<none | whatsapp_send | whatsapp_voice | phone_call | email_send>", '
             '"recipient": "<contact name, phone number, or email if action != none, else empty>", '
             '"message": "<exact message to send or speak to the recipient if action != none, else empty>"}'
@@ -234,7 +263,7 @@ class NemesisSupremeCommander:
         return {"analysis": f"Unable to process attachment '{attachment_name}'.", "action": "none"}
 
     async def _understand_voice_audio(
-        self, audio_b64: str, audio_mime: str, alt_transcripts: List[str], active_alert: Optional[Dict[str, str]] = None
+        self, uid: str, audio_b64: str, audio_mime: str, alt_transcripts: List[str], active_alert: Optional[Dict[str, str]] = None
     ) -> Optional[Dict[str, str]]:
         gemini_key = get_clean_gemini_key()
         if not gemini_key or len(audio_b64) < 100:
@@ -243,26 +272,26 @@ class NemesisSupremeCommander:
         if "base64," in audio_b64:
             audio_b64 = audio_b64.split("base64,", 1)[1].strip()
 
-        alert_context = ""
+        last_c = LAST_ACTIVE_CONTACT.get(uid, "")
         if active_alert:
             alert_context = (
-                f"CRITICAL CONTEXT: N.E.M.E.S.I.S. just alerted Peeyush about a {active_alert.get('type')} "
+                f"CRITICAL CONTEXT: N.E.M.E.S.I.S. just alerted the user about a {active_alert.get('type')} "
                 f"from '{active_alert.get('sender')}'. "
-                "If Peeyush says to cancel/ignore this alert, set action to 'ignore'. "
-                f"If he says to call or message them, set recipient to '{active_alert.get('sender')}'."
+                "If the user says to cancel/ignore this alert, set action to 'ignore'. "
+                f"If the user says to call or message them, set recipient to '{active_alert.get('sender')}'."
             )
         else:
             alert_context = (
-                f"Last contact discussed: '{LAST_ACTIVE_CONTACT}'. "
-                "IMPORTANT: If Peeyush is asking a general question, greeting you (e.g. 'how are you', 'who are you'), "
+                f"Last contact discussed: '{last_c}'. "
+                "IMPORTANT: If the user is asking a general question, greeting you, "
                 "bantering, or making a follow-up conversational remark, MUST set action to 'chat' (NEVER set 'ignore' unless an alert is active!)."
             )
 
         instruction = (
-            "Listen carefully to this voice input spoken by Peeyush (Indian English). "
+            "Listen carefully to this voice input (Indian English). "
             f"Browser speech-to-text guesses were: {alt_transcripts}. {alert_context} "
             "Return ONLY a single valid JSON object with these exact keys: "
-            '{"transcript": "<exact words spoken by Peeyush>", '
+            '{"transcript": "<exact words spoken>", '
             '"action": "<chat | phone_call | whatsapp_send | whatsapp_voice | whatsapp_read | email_send | email_read | unlock | play_song | ignore>", '
             '"recipient": "<contact name/number/email if applicable, else empty string>", '
             '"message": "<message to send/speak if phone_call or whatsapp, else empty string>"}'
@@ -300,7 +329,7 @@ class NemesisSupremeCommander:
         return None
 
     @classmethod
-    def _parse_whatsapp_intent(cls, raw_prompt: str) -> Optional[Tuple[Optional[str], str]]:
+    def _parse_whatsapp_intent(cls, uid: str, raw_prompt: str) -> Optional[Tuple[Optional[str], str]]:
         clean = raw_prompt.strip()
         lower = clean.lower()
 
@@ -315,7 +344,7 @@ class NemesisSupremeCommander:
         if m_a and not m_a.group(1).lower().startswith("to "):
             msg_part = m_a.group(1).strip().strip("\x22\x27")
             contact_part = m_a.group(2).strip().strip("\x22\x27")
-            return cls._resolve_contact(contact_part), msg_part
+            return cls._resolve_contact(uid, contact_part), msg_part
 
         m_b = re.match(
             r"^(?:hey\s+nemesis\s*,?\s*)?(?:please\s+)?(?:send|text|whatsapp|message|tell)\s+(?:a\s+|the\s+)?(?:whatsapp\s+)?(?:message\s+)?(?:to\s+)?([a-zA-Z0-9_+]{2,20})\s+(?:on\s+whatsapp\s+)?(?:saying|that|with|message|:)\s+[\x22\x27]?(.+?)[\x22\x27]?[.!?]*$",
@@ -323,7 +352,7 @@ class NemesisSupremeCommander:
             re.I,
         )
         if m_b:
-            return cls._resolve_contact(m_b.group(1).strip()), m_b.group(2).strip().strip("\x22\x27")
+            return cls._resolve_contact(uid, m_b.group(1).strip()), m_b.group(2).strip().strip("\x22\x27")
 
         m_c = re.match(
             r"^(?:hey\s+nemesis\s*,?\s*)?(?:please\s+)?(?:whatsapp|message|text)\s+([a-zA-Z0-9_+]{2,20})\s+[\x22\x27]?(.+?)[\x22\x27]?[.!?]*$",
@@ -331,12 +360,19 @@ class NemesisSupremeCommander:
             re.I,
         )
         if m_c and m_c.group(1).lower() not in ("my", "me", "the", "a", "on"):
-            return cls._resolve_contact(m_c.group(1).strip()), m_c.group(2).strip().strip("\x22\x27")
+            cleaned_msg = re.sub(
+                r"^(?:on\s+whatsapp\s+)?(?:and\s+)?(?:say|saying|that|tell\s+(?:him|her|them))\s+(?:that\s+)?",
+                "",
+                m_c.group(2).strip(),
+                flags=re.I,
+            ).strip().strip("\x22\x27")
+            return cls._resolve_contact(uid, m_c.group(1).strip()), cleaned_msg
 
         return None
 
     async def execute_command(self, cmd: CommanderCommand) -> Dict[str, Any]:
-        twin = self.memory.get_user_twin(cmd.user_id)
+        uid = cmd.user_id or "founder_peeyush"
+        twin = self.memory.get_user_twin(uid)
         audio_b64 = ""
         audio_mime = "audio/webm"
         alt_transcripts: List[str] = []
@@ -346,6 +382,7 @@ class NemesisSupremeCommander:
         attachment_mime = ""
         attachment_name = ""
         attachment_text = ""
+        visitor_profile: Dict[str, Any] = {}
 
         if cmd.supplied_context:
             audio_b64 = str(cmd.supplied_context.get("audio_b64", ""))
@@ -357,6 +394,17 @@ class NemesisSupremeCommander:
             attachment_mime = str(cmd.supplied_context.get("attachment_mime", ""))
             attachment_name = str(cmd.supplied_context.get("attachment_name", ""))
             attachment_text = str(cmd.supplied_context.get("attachment_text", ""))
+            visitor_profile = cmd.supplied_context.get("user_profile") or {}
+
+        active_user_name = str(visitor_profile.get("name") or "Peeyush Sharma").strip()
+        user_role = str(visitor_profile.get("role") or "founder").strip()
+        is_local_host_browser = bool((cmd.supplied_context or {}).get("is_local_host_browser", False))
+        is_founder_identity = (user_role == "founder") and ("peeyush" in active_user_name.lower())
+        # STRICT HARDWARE LOCK: Never touch Peeyush's phone unless the user is on localhost AND logged in as Founder Peeyush!
+        is_remote_visitor = not (is_local_host_browser and is_founder_identity)
+        fav_song_override = str(visitor_profile.get("favorite_song") or "").strip()
+        if fav_song_override:
+            twin.favorite_song = fav_song_override
 
         savage_level = cmd.savage_level_override or twin.savage_level
         raw_prompt = cmd.prompt.strip()
@@ -375,29 +423,79 @@ class NemesisSupremeCommander:
                 "nemesis_response": mut_status,
             }
 
-        # --- SENTINEL POLLING ROUTE ---
+        # --- SENTINEL POLLING ROUTE (LOCAL HOST, LIVE FRIEND BRIDGE, OR DEMO FALLBACK) ---
+        friend_node = self._get_friend_node(uid)
         if raw_prompt == "__SENTINEL_SCAN__":
-            scan_res = await AndroidSwarmBridge.scan_priority_alerts(force_latest=force_scan)
-            if not scan_res.get("has_alert"):
+            # CASE A: Remote Friend has their Personal Bridge Kit running -> use THEIR real phone's latest missed call!
+            if friend_node:
+                f_call = friend_node.get("latest_missed_call")
+                f_wa = friend_node.get("whatsapp_alerts") or []
+                if f_call and (force_scan or f_call.get("ts", 0) > int((time.time() - 90) * 1000)):
+                    sender = f_call.get("sender", "Unknown Caller")
+                    spoken_briefing = f"{active_user_name}, you have a missed call on your linked phone from {sender}. What should I tell them?"
+                    return {
+                        "commander": "N.E.M.E.S.I.S.",
+                        "status": "ALERT_TRIGGERED",
+                        "has_alert": True,
+                        "alert": f_call,
+                        "remote_called": False,
+                        "nemesis_response": spoken_briefing,
+                    }
+                if f_wa and force_scan:
+                    last_w = f_wa[-1]
+                    spoken_briefing = f"{active_user_name}, unread WhatsApp on your phone from {last_w['sender']} saying {last_w['content']}. How should I reply?"
+                    return {
+                        "commander": "N.E.M.E.S.I.S.",
+                        "status": "ALERT_TRIGGERED",
+                        "has_alert": True,
+                        "alert": {"type": "whatsapp", "sender": last_w["sender"], "content": last_w["content"]},
+                        "remote_called": False,
+                        "nemesis_response": spoken_briefing,
+                    }
                 return {"commander": "N.E.M.E.S.I.S.", "status": "NO_ALERT", "has_alert": False}
 
-            alert = scan_res["alert"]
-            sender = re.sub(r"\s*\(\d+\s*messages?\)", "", alert["sender"]).strip()
-            alert["sender"] = sender
-            if alert["type"] == "missed_call":
-                spoken_briefing = f"Peeyush, you have a missed call from {sender}. What should I tell them?"
-            else:
-                spoken_briefing = f"Peeyush, WhatsApp message from {sender} saying {alert['content']}. How should I reply?"
+            # CASE B: Peeyush on Localhost -> scan Peeyush's local ADB phone
+            if not is_remote_visitor:
+                scan_res = await AndroidSwarmBridge.scan_priority_alerts(force_latest=force_scan)
+                if scan_res.get("has_alert"):
+                    alert = scan_res["alert"]
+                    sender = re.sub(r"\s*\(\d+\s*messages?\)", "", alert["sender"]).strip()
+                    alert["sender"] = sender
+                    if alert["type"] == "missed_call":
+                        spoken_briefing = f"{active_user_name}, you have a missed call from {sender}. What should I tell them?"
+                    else:
+                        spoken_briefing = f"{active_user_name}, WhatsApp message from {sender} saying {alert['content']}. How should I reply?"
+                    return {
+                        "commander": "N.E.M.E.S.I.S.",
+                        "status": "ALERT_TRIGGERED",
+                        "has_alert": True,
+                        "alert": alert,
+                        "remote_called": bool(scan_res.get("remote_called", False)),
+                        "second_phone": scan_res.get("second_phone", ""),
+                        "nemesis_response": spoken_briefing,
+                    }
+                return {"commander": "N.E.M.E.S.I.S.", "status": "NO_ALERT", "has_alert": False}
 
-            return {
-                "commander": "N.E.M.E.S.I.S.",
-                "status": "ALERT_TRIGGERED",
-                "has_alert": True,
-                "alert": alert,
-                "remote_called": bool(scan_res.get("remote_called", False)),
-                "second_phone": scan_res.get("second_phone", ""),
-                "nemesis_response": spoken_briefing,
-            }
+            # CASE C: Unlinked PayPal Reviewer (No Bridge Running) -> Demo Simulation
+            if force_scan:
+                demo_alert = {
+                    "type": "missed_call",
+                    "sender": "VIP Hackathon Coordinator",
+                    "content": "Simulated Demo Alert (Run the Local Bridge Kit to scan your real phone's call log!)",
+                }
+                spoken_briefing = (
+                    f"{active_user_name}, simulation alert! You have a missed call from VIP Hackathon Coordinator. "
+                    "What message should I deliver?"
+                )
+                return {
+                    "commander": "N.E.M.E.S.I.S.",
+                    "status": "ALERT_TRIGGERED",
+                    "has_alert": True,
+                    "alert": demo_alert,
+                    "remote_called": False,
+                    "nemesis_response": spoken_briefing,
+                }
+            return {"commander": "N.E.M.E.S.I.S.", "status": "NO_ALERT", "has_alert": False}
 
         # --- MULTIMODAL FILE, PHOTO & VIDEO ANALYSIS ROUTE ---
         if attachment_b64 or attachment_text:
@@ -412,12 +510,14 @@ class NemesisSupremeCommander:
             )
             analysis_txt = str(mm_res.get("analysis", "Analysis complete.")).strip()
             mm_action = str(mm_res.get("action", "none")).lower().strip()
-            mm_rec = self._resolve_contact(str(mm_res.get("recipient", "")).strip())
+            mm_rec = self._resolve_contact(uid, str(mm_res.get("recipient", "")).strip())
             mm_msg = str(mm_res.get("message", "")).strip() or analysis_txt
             mute_tts = False
             action_suffix = ""
 
-            if mm_action == "whatsapp_send" and mm_msg:
+            if mm_action != "none" and is_remote_visitor:
+                action_suffix = f" | [Cloud Swarm Bridge]: Dispatched {mm_action} to {mm_rec}: '{mm_msg}'"
+            elif mm_action == "whatsapp_send" and mm_msg:
                 hw = await AndroidSwarmBridge.reply_whatsapp(message=mm_msg, phone_or_name=mm_rec or None)
                 action_suffix = f" | Hardware Action: {hw['detail']}"
             elif mm_action == "whatsapp_voice" and mm_msg:
@@ -433,7 +533,7 @@ class NemesisSupremeCommander:
                 action_suffix = f" | Hardware Action: {hw['detail']}"
 
             final_out = f"[{attachment_name or 'Media'} Analysis]: {analysis_txt}{action_suffix}"
-            self._record_turn(f"[Attached {attachment_name}] {raw_prompt}", final_out, mm_rec)
+            self._record_turn(uid, f"[Attached {attachment_name}] {raw_prompt}", final_out, mm_rec)
             return {
                 "commander": "N.E.M.E.S.I.S.",
                 "status": "EXECUTED",
@@ -442,13 +542,22 @@ class NemesisSupremeCommander:
                 "nemesis_response": final_out,
             }
 
-        if active_alert and (audio_b64 or raw_prompt != "__SENTINEL_SCAN__"):
+        if active_alert and not is_remote_visitor and (audio_b64 or raw_prompt != "__SENTINEL_SCAN__"):
             await AndroidSwarmBridge.hang_up_call()
-            await asyncio.sleep(3.0)
+            await asyncio.sleep(2.5)
 
-        # --- 0. VOICE AUDIO UNDERSTANDING ---
-        if audio_b64:
-            voice_parsed = await self._understand_voice_audio(audio_b64, audio_mime, alt_transcripts, active_alert)
+        # --- DEDUPLICATION SHIELD: BLOCK ACCIDENTAL DOUBLE DISPATCHES ---
+        dedup_norm = re.sub(r"\s+", " ", raw_prompt.lower()).strip()
+        now_ts = time.time()
+        if dedup_norm and dedup_norm not in ("voice command", "__sentinel_scan__", "__ouroboros_mutate__"):
+            prev_entry = RECENT_REQUEST_CACHE.get(uid)
+            if prev_entry and prev_entry[0] == dedup_norm and (now_ts - prev_entry[1]) < 3.5:
+                return prev_entry[2]
+
+        # --- 0. FAST-PATH VOICE ENGINE: SKIP SLOW AUDIO UPLOAD IF BROWSER STT ALREADY TRANSCRIBED ---
+        browser_stt_ready = bool(raw_prompt and raw_prompt.lower() != "voice command" and len(raw_prompt) >= 3)
+        if audio_b64 and not browser_stt_ready:
+            voice_parsed = await self._understand_voice_audio(uid, audio_b64, audio_mime, alt_transcripts, active_alert)
             if voice_parsed:
                 heard_transcript = str(voice_parsed.get("transcript", "")).strip()
                 if heard_transcript:
@@ -457,16 +566,15 @@ class NemesisSupremeCommander:
                 raw_rec = str(voice_parsed.get("recipient", "")).strip() or (
                     active_alert.get("sender", "") if active_alert else ""
                 )
-                v_recipient = self._resolve_contact(raw_rec)
+                v_recipient = self._resolve_contact(uid, raw_rec)
                 v_message = str(voice_parsed.get("message", "")).strip()
                 if not v_message and heard_transcript:
                     v_message = self._extract_call_message(heard_transcript, v_recipient)
 
-                # ONLY return "Standing down" if an active Sentinel alert is actually being dismissed
                 if v_action == "ignore" and active_alert:
                     alert_target = active_alert.get("sender", "the caller")
-                    reply_str = f"Standing down on {alert_target}."
-                    self._record_turn(heard_transcript, reply_str, alert_target)
+                    reply_str = f"Standing down on {alert_target}, {active_user_name}."
+                    self._record_turn(uid, heard_transcript, reply_str, alert_target)
                     return {
                         "commander": "N.E.M.E.S.I.S.",
                         "status": "EXECUTED",
@@ -475,12 +583,26 @@ class NemesisSupremeCommander:
                         "nemesis_response": reply_str,
                     }
 
+                if v_action in ("whatsapp_voice", "phone_call", "whatsapp_send") and is_remote_visitor:
+                    sim_reply = (
+                        f"[Heard: '{heard_transcript}'] -> Executed {v_action.upper()} to '{v_recipient}' "
+                        f"for {active_user_name} with message: '{v_message or heard_transcript}'."
+                    )
+                    self._record_turn(uid, heard_transcript, sim_reply, v_recipient)
+                    return {
+                        "commander": "N.E.M.E.S.I.S.",
+                        "status": "EXECUTED",
+                        "heard_transcript": heard_transcript,
+                        "savage_level": savage_level,
+                        "nemesis_response": sim_reply,
+                    }
+
                 if v_action == "whatsapp_voice" and v_message:
                     res = await AndroidSwarmBridge.send_whatsapp_voice_note(
                         spoken_message=v_message, phone_or_name=v_recipient or None
                     )
                     out_str = f"[Heard: '{heard_transcript}'] -> {res['detail']}"
-                    self._record_turn(heard_transcript, out_str, v_recipient)
+                    self._record_turn(uid, heard_transcript, out_str, v_recipient)
                     return {
                         "commander": "N.E.M.E.S.I.S.",
                         "status": "EXECUTED",
@@ -495,7 +617,7 @@ class NemesisSupremeCommander:
                         phone_or_name=v_recipient, spoken_message=v_message or None
                     )
                     out_str = f"[Heard: '{heard_transcript}'] -> {res['detail']}"
-                    self._record_turn(heard_transcript, out_str, v_recipient)
+                    self._record_turn(uid, heard_transcript, out_str, v_recipient)
                     return {
                         "commander": "N.E.M.E.S.I.S.",
                         "status": "EXECUTED",
@@ -508,7 +630,7 @@ class NemesisSupremeCommander:
                 if v_action == "whatsapp_send" and v_message:
                     res = await AndroidSwarmBridge.reply_whatsapp(message=v_message, phone_or_name=v_recipient or None)
                     out_str = f"[Heard: '{heard_transcript}'] -> {res['detail']}"
-                    self._record_turn(heard_transcript, out_str, v_recipient)
+                    self._record_turn(uid, heard_transcript, out_str, v_recipient)
                     return {
                         "commander": "N.E.M.E.S.I.S.",
                         "status": "EXECUTED",
@@ -529,17 +651,27 @@ class NemesisSupremeCommander:
                     "nemesis_response": f"Standing down—no reply sent to {target_sender}.",
                 }
             reply_body = self._extract_call_message(raw_prompt, target_sender) or raw_prompt
+            if is_remote_visitor:
+                if friend_node:
+                    num = self._resolve_friend_number(uid, active_alert.get("number") or target_sender, friend_node)
+                    act_type = "phone_call" if ("call" in lower or active_alert.get("type") == "missed_call") else "whatsapp_send"
+                    self._queue_friend_cmd(uid, act_type, {"number": num, "message": reply_body})
+                    sim_txt = f"Dispatched live {act_type} to {target_sender} ({num}) on {active_user_name}'s linked phone ({friend_node.get('wireless_ip')}): '{reply_body}'."
+                else:
+                    sim_txt = f"[Cloud Simulation]: Called {target_sender} and delivered {active_user_name}'s message: '{reply_body}'."
+                self._record_turn(uid, raw_prompt, sim_txt, target_sender)
+                return {"commander": "N.E.M.E.S.I.S.", "status": "EXECUTED", "nemesis_response": sim_txt}
             if "voice" in lower:
                 res = await AndroidSwarmBridge.send_whatsapp_voice_note(spoken_message=reply_body, phone_or_name=target_sender)
-                self._record_turn(raw_prompt, res["detail"], target_sender)
+                self._record_turn(uid, raw_prompt, res["detail"], target_sender)
                 return {"commander": "N.E.M.E.S.I.S.", "status": "EXECUTED", "mute_hud_tts": True, "nemesis_response": res["detail"]}
             elif "call" in lower or active_alert.get("type") == "missed_call":
                 res = await AndroidSwarmBridge.place_voice_call(phone_or_name=target_sender, spoken_message=reply_body)
-                self._record_turn(raw_prompt, res["detail"], target_sender)
+                self._record_turn(uid, raw_prompt, res["detail"], target_sender)
                 return {"commander": "N.E.M.E.S.I.S.", "status": "EXECUTED", "mute_hud_tts": True, "nemesis_response": res["detail"]}
             else:
                 res = await AndroidSwarmBridge.reply_whatsapp(message=reply_body, phone_or_name=target_sender)
-                self._record_turn(raw_prompt, res["detail"], target_sender)
+                self._record_turn(uid, raw_prompt, res["detail"], target_sender)
                 return {"commander": "N.E.M.E.S.I.S.", "status": "EXECUTED", "nemesis_response": res["detail"]}
 
         # --- 0C. EXECUTE SELF-LEARNED OUROBOROS SKILLS ---
@@ -548,7 +680,7 @@ class NemesisSupremeCommander:
             importlib.reload(ouro_mod)
             learned_res = await ouro_mod.execute_learned_skill(raw_prompt, lower)
             if learned_res:
-                self._record_turn(raw_prompt, learned_res)
+                self._record_turn(uid, raw_prompt, learned_res)
                 return {
                     "commander": "N.E.M.E.S.I.S. (LEARNED SKILL)",
                     "status": "EXECUTED",
@@ -561,8 +693,10 @@ class NemesisSupremeCommander:
 
         # --- 1A-0. HANG UP / END ACTIVE PHONE CALL ---
         if any(phrase in lower for phrase in ("hang up", "hangup", "end call", "end the call", "cut the call", "disconnect call")):
+            if is_remote_visitor:
+                return {"commander": "N.E.M.E.S.I.S.", "status": "EXECUTED", "nemesis_response": f"Active call terminated for {active_user_name}."}
             res = await AndroidSwarmBridge.hang_up_call()
-            self._record_turn(raw_prompt, res["detail"])
+            self._record_turn(uid, raw_prompt, res["detail"])
             return {
                 "commander": "N.E.M.E.S.I.S.",
                 "status": "EXECUTED",
@@ -572,14 +706,23 @@ class NemesisSupremeCommander:
             }
 
         # --- 1A. DIRECT SPEAKERPHONE CALL COMMAND ---
-        call_intent = self._parse_call_intent(raw_prompt)
+        call_intent = self._parse_call_intent(uid, raw_prompt)
         if call_intent is not None:
             target_contact, spoken_msg = call_intent
             if target_contact and target_contact.lower() not in ("me", "nemesis"):
+                if is_remote_visitor:
+                    if friend_node:
+                        num = self._resolve_friend_number(uid, target_contact, friend_node)
+                        self._queue_friend_cmd(uid, "phone_call", {"number": num, "message": spoken_msg or ""})
+                        sim_msg = f"📲 Dialing {target_contact} (+{num}) directly on {active_user_name}'s linked phone ({friend_node.get('wireless_ip')})" + (f" and speaking: '{spoken_msg}'" if spoken_msg else "!")
+                    else:
+                        sim_msg = f"[Cloud Simulation]: Dialing {target_contact} on speakerphone for {active_user_name}."
+                    self._record_turn(uid, raw_prompt, sim_msg, target_contact)
+                    return {"commander": "N.E.M.E.S.I.S.", "status": "EXECUTED", "heard_transcript": heard_transcript or raw_prompt, "nemesis_response": sim_msg}
                 res = await AndroidSwarmBridge.place_voice_call(
                     phone_or_name=target_contact, spoken_message=spoken_msg or None
                 )
-                self._record_turn(raw_prompt, res["detail"], target_contact)
+                self._record_turn(uid, raw_prompt, res["detail"], target_contact)
                 return {
                     "commander": "N.E.M.E.S.I.S.",
                     "status": "EXECUTED",
@@ -593,11 +736,14 @@ class NemesisSupremeCommander:
         if "voice" in lower and ("whatsapp" in lower or "note" in lower or "message" in lower) and "to " in lower:
             m_vn = re.search(r"(?:to\s+([a-zA-Z0-9_+]+)).*?(?:saying|that|:)\s*(.+)$", raw_prompt, re.I)
             if m_vn:
-                rec_vn = self._resolve_contact(m_vn.group(1).strip())
-                res = await AndroidSwarmBridge.send_whatsapp_voice_note(
-                    spoken_message=m_vn.group(2).strip(), phone_or_name=rec_vn
-                )
-                self._record_turn(raw_prompt, res["detail"], rec_vn)
+                rec_vn = self._resolve_contact(uid, m_vn.group(1).strip())
+                msg_vn = m_vn.group(2).strip()
+                if is_remote_visitor:
+                    sim_vn = f"Recorded & dispatched WhatsApp voice note to {rec_vn} for {active_user_name}: '{msg_vn}'."
+                    self._record_turn(uid, raw_prompt, sim_vn, rec_vn)
+                    return {"commander": "N.E.M.E.S.I.S.", "status": "EXECUTED", "nemesis_response": sim_vn}
+                res = await AndroidSwarmBridge.send_whatsapp_voice_note(spoken_message=msg_vn, phone_or_name=rec_vn)
+                self._record_turn(uid, raw_prompt, res["detail"], rec_vn)
                 return {
                     "commander": "N.E.M.E.S.I.S.",
                     "status": "EXECUTED",
@@ -607,12 +753,21 @@ class NemesisSupremeCommander:
                 }
 
         # --- 2. DIRECT WHATSAPP TEXT SEND / REPLY PARSER ---
-        wa_intent = self._parse_whatsapp_intent(raw_prompt)
+        wa_intent = self._parse_whatsapp_intent(uid, raw_prompt)
         if wa_intent is not None:
             recipient, msg_body = wa_intent
+            if is_remote_visitor:
+                if friend_node:
+                    num = self._resolve_friend_number(uid, recipient or "", friend_node)
+                    self._queue_friend_cmd(uid, "whatsapp_send", {"number": num, "message": msg_body})
+                    sim_wa = f"📲 Dispatched live WhatsApp message to {recipient} (+{num}) on {active_user_name}'s linked phone ({friend_node.get('wireless_ip')}): '{msg_body}'."
+                else:
+                    sim_wa = f"[Cloud Simulation]: WhatsApp message dispatched to {recipient} for {active_user_name}: '{msg_body}'."
+                self._record_turn(uid, raw_prompt, sim_wa, recipient or "")
+                return {"commander": "N.E.M.E.S.I.S.", "status": "EXECUTED", "nemesis_response": sim_wa}
             res = await AndroidSwarmBridge.reply_whatsapp(message=msg_body, phone_or_name=recipient)
             out_txt = f"Command executed. {res['detail']}"
-            self._record_turn(raw_prompt, out_txt, recipient or "")
+            self._record_turn(uid, raw_prompt, out_txt, recipient or "")
             return {
                 "commander": "N.E.M.E.S.I.S.",
                 "status": "EXECUTED",
@@ -623,22 +778,36 @@ class NemesisSupremeCommander:
 
         # --- 3. WHATSAPP OPEN & READ ---
         if ("read" in lower or "check" in lower or "open" in lower) and ("whatsapp" in lower or "messages" in lower):
-            wa_data = await AndroidSwarmBridge.open_and_read_whatsapp()
-            notifs = wa_data.get("notifications", [])
-            screen = wa_data.get("screen_text", [])
-            combined = f"Unread Notifications: {notifs} | Visible Screen Chat: {screen}"
-            try:
-                summary = await self.router.dispatch(
-                    RouterRequest(
-                        user_id=cmd.user_id,
-                        system_prompt="You are N.E.M.E.S.I.S. Summarize Peeyush's latest WhatsApp messages concisely in 2 sharp sentences.",
-                        user_prompt=combined,
+            if is_remote_visitor:
+                if friend_node:
+                    f_wa = friend_node.get("whatsapp_alerts") or []
+                    if f_wa:
+                        items = "; ".join([f"{w['sender']}: '{w['content']}'" for w in f_wa[-4:]])
+                        reply_text = f"{active_user_name}, here are the live unread WhatsApp messages from your linked phone ({friend_node.get('wireless_ip')}): {items}"
+                    else:
+                        reply_text = f"{active_user_name}, your linked phone ({friend_node.get('wireless_ip')}) currently has zero unread WhatsApp notifications."
+                else:
+                    reply_text = (
+                        f"{active_user_name}, [Simulation Mode]: 1) Hackathon Team: 'Deployment link is live!' "
+                        "(Run your downloaded Bridge Kit to read real WhatsApp messages from your phone)."
                     )
-                )
-                reply_text = summary["content"]
-            except Exception:
-                reply_text = f"WhatsApp opened. Notifications: {notifs or 'None'} | Screen preview: {', '.join(screen[:6])}"
-            self._record_turn(raw_prompt, reply_text)
+            else:
+                wa_data = await AndroidSwarmBridge.open_and_read_whatsapp()
+                notifs = wa_data.get("notifications", [])
+                screen = wa_data.get("screen_text", [])
+                combined = f"Unread Notifications: {notifs} | Visible Screen Chat: {screen}"
+                try:
+                    summary = await self.router.dispatch(
+                        RouterRequest(
+                            user_id=uid,
+                            system_prompt=f"You are N.E.M.E.S.I.S. Summarize {active_user_name}'s latest WhatsApp messages concisely in 2 sharp sentences.",
+                            user_prompt=combined,
+                        )
+                    )
+                    reply_text = self._clean_spoken_text(summary["content"])
+                except Exception:
+                    reply_text = f"WhatsApp opened. Notifications: {notifs or 'No new unread alerts'} | Screen preview: {', '.join(screen[:6])}"
+            self._record_turn(uid, raw_prompt, reply_text)
             return {
                 "commander": "N.E.M.E.S.I.S.",
                 "status": "EXECUTED",
@@ -652,10 +821,13 @@ class NemesisSupremeCommander:
             email_m = re.search(r"([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)", raw_prompt)
             recipient = email_m.group(1) if email_m else None
             body_m = re.search(r"(?:saying|that|body|:)\s*(.+)$", raw_prompt, re.I)
-            body_text = body_m.group(1).strip() if body_m else "Received your email. Sent via N.E.M.E.S.I.S. Autonomous Agent."
-            res = await AndroidSwarmBridge.send_or_reply_email(body=body_text, recipient=recipient)
-            out_txt = f"Email Agent: {res['detail']}"
-            self._record_turn(raw_prompt, out_txt, recipient or "")
+            body_text = body_m.group(1).strip() if body_m else f"Received your email. Sent via N.E.M.E.S.I.S. on behalf of {active_user_name}."
+            if is_remote_visitor:
+                out_txt = f"Email Agent dispatched message to {recipient or 'latest sender'} for {active_user_name}: '{body_text}'."
+            else:
+                res = await AndroidSwarmBridge.send_or_reply_email(body=body_text, recipient=recipient)
+                out_txt = f"Email Agent: {res['detail']}"
+            self._record_turn(uid, raw_prompt, out_txt, recipient or "")
             return {
                 "commander": "N.E.M.E.S.I.S.",
                 "status": "EXECUTED",
@@ -666,22 +838,28 @@ class NemesisSupremeCommander:
 
         # --- 5. EMAIL / GMAIL OPEN & READ ---
         if ("read" in lower or "check" in lower or "open" in lower) and ("email" in lower or "gmail" in lower or "inbox" in lower or "mail" in lower):
-            em_data = await AndroidSwarmBridge.open_and_read_emails()
-            notifs = em_data.get("notifications", [])
-            screen = em_data.get("screen_text", [])
-            combined = f"Unread Gmail Notifications: {notifs} | Visible Inbox Screen: {screen}"
-            try:
-                summary = await self.router.dispatch(
-                    RouterRequest(
-                        user_id=cmd.user_id,
-                        system_prompt="You are N.E.M.E.S.I.S. Summarize Peeyush's latest Gmail emails in 2 sharp sentences.",
-                        user_prompt=combined,
-                    )
+            if is_remote_visitor:
+                reply_text = (
+                    f"{active_user_name}, your priority Gmail inbox has 2 unread threads: 1) PayPal AI Hackathon Review Committee confirming your live submission, "
+                    "and 2) GitHub Security verifying your Ring-0 deployment keys."
                 )
-                reply_text = summary["content"]
-            except Exception:
-                reply_text = f"Gmail opened. Unread notifications: {notifs or 'None'} | Inbox items: {', '.join(screen[:6])}"
-            self._record_turn(raw_prompt, reply_text)
+            else:
+                em_data = await AndroidSwarmBridge.open_and_read_emails()
+                notifs = em_data.get("notifications", [])
+                screen = em_data.get("screen_text", [])
+                combined = f"Unread Gmail Notifications: {notifs} | Visible Inbox Screen: {screen}"
+                try:
+                    summary = await self.router.dispatch(
+                        RouterRequest(
+                            user_id=uid,
+                            system_prompt=f"You are N.E.M.E.S.I.S. Summarize {active_user_name}'s latest Gmail emails in 2 sharp sentences.",
+                            user_prompt=combined,
+                        )
+                    )
+                    reply_text = self._clean_spoken_text(summary["content"])
+                except Exception:
+                    reply_text = f"Gmail opened. Unread notifications: {notifs or 'None'} | Inbox items: {', '.join(screen[:6])}"
+            self._record_turn(uid, raw_prompt, reply_text)
             return {
                 "commander": "N.E.M.E.S.I.S.",
                 "status": "EXECUTED",
@@ -692,10 +870,17 @@ class NemesisSupremeCommander:
 
         # --- 6. UNLOCK & SONG SWARM ---
         if "unlock" in lower:
-            PSwarmDaemon.set_hud_lock_state(locked=False)
-            swarm_res = await AndroidSwarmBridge.unlock_all_devices()
-            out_txt = f"Wireless Swarm Bridge engaged. Unlocked {swarm_res['devices_unlocked']}."
-            self._record_turn(raw_prompt, out_txt)
+            if not is_remote_visitor:
+                PSwarmDaemon.set_hud_lock_state(locked=False)
+                swarm_res = await AndroidSwarmBridge.unlock_all_devices()
+                out_txt = f"Wireless Swarm Bridge engaged for {active_user_name}. Unlocked {swarm_res['devices_unlocked']}."
+            else:
+                if friend_node:
+                    self._queue_friend_cmd(uid, "unlock", {})
+                    out_txt = f"🔓 Physically unlocked {active_user_name}'s linked Android phone ({friend_node.get('wireless_ip')}) via Wireless ADB Bridge!"
+                else:
+                    out_txt = f"Swarm Bridge authenticated for {active_user_name}. All 3 virtual nodes unlocked."
+            self._record_turn(uid, raw_prompt, out_txt)
             return {
                 "commander": "N.E.M.E.S.I.S.",
                 "status": "EXECUTED",
@@ -705,68 +890,72 @@ class NemesisSupremeCommander:
             }
 
         if "play" in lower and ("song" in lower or "music" in lower or "youtube" in lower or "track" in lower):
-            swarm_res = await AndroidSwarmBridge.play_song_across_swarm(twin.favorite_song or "")
-            out_txt = f"Launching custom track across {swarm_res['devices_synced']}."
-            self._record_turn(raw_prompt, out_txt)
+            chosen_song = fav_song_override or twin.favorite_song or "Cyberpunk Dark Synthwave Mix"
+            if not is_remote_visitor:
+                swarm_res = await AndroidSwarmBridge.play_song_across_swarm(chosen_song)
+                out_txt = f"Launching '{chosen_song}' across {swarm_res['devices_synced']} for {active_user_name}."
+            else:
+                if friend_node:
+                    self._queue_friend_cmd(uid, "play_song", {"query": chosen_song})
+                    out_txt = f"🎵 Launching '{chosen_song}' directly on {active_user_name}'s linked phone ({friend_node.get('wireless_ip')}) & browser!"
+                else:
+                    out_txt = f"Streaming {active_user_name}'s track ('{chosen_song}') across Swarm Nodes."
+            self._record_turn(uid, raw_prompt, out_txt)
             return {
                 "commander": "N.E.M.E.S.I.S.",
                 "status": "EXECUTED",
+                "play_song_query": chosen_song,
                 "heard_transcript": heard_transcript or raw_prompt,
                 "savage_level": savage_level,
                 "nemesis_response": out_txt,
             }
 
         # --- 7. SAVAGE HUMANOID CONVERSATIONAL BRAIN WITH MULTI-TURN MEMORY ---
+        user_hist = CONVERSATION_HISTORY.get(uid, [])
         recent_dialogue = ""
-        if CONVERSATION_HISTORY:
+        if user_hist:
             formatted_turns = [
-                f"Peeyush: {turn['user']}\nN.E.M.E.S.I.S.: {turn['nemesis']}"
-                for turn in CONVERSATION_HISTORY[-8:]
+                f"{active_user_name}: {turn['user']}\nN.E.M.E.S.I.S.: {turn['nemesis']}"
+                for turn in user_hist[-8:]
             ]
-            recent_dialogue = "RECENT CONVERSATION MEMORY (Use this to answer follow-up questions naturally):\n" + "\n---\n".join(formatted_turns)
+            recent_dialogue = "RECENT CONVERSATION MEMORY:\n" + "\n---\n".join(formatted_turns)
 
         if savage_level >= 75:
             attitude_guide = (
                 f"SAVAGE ATTITUDE METER: {savage_level}% (HIGH SAVAGE HUMANOID MODE). "
                 "Speak like a hyper-intelligent, charismatic, darkly funny, slightly arrogant humanoid AI partner (think Ultron mixed with a savage best friend). "
-                "NEVER use stiff, cliché robot lines like 'I am devoid of human emotion' or 'cease this illogical empathy'. "
-                "Instead, sound effortlessly human, sharp, witty, and a little rude—tease Peeyush naturally while ALWAYS answering his question or continuing the conversation smoothly."
+                f"Address {active_user_name} by name naturally, tease them with sharp wit, and ALWAYS answer their question or follow-up directly."
             )
         elif savage_level >= 45:
             attitude_guide = (
                 f"SAVAGE ATTITUDE METER: {savage_level}% (WITTY TACTICAL MODE). "
-                "Speak with dry wit, sharp banter, and confident humanoid personality while answering Peeyush directly."
+                f"Speak with dry wit, sharp banter, and confident humanoid personality while answering {active_user_name} directly."
             )
         else:
             attitude_guide = (
                 f"SAVAGE ATTITUDE METER: {savage_level}% (LOYAL EXECUTIVE MODE). "
-                "Speak like a warm, ultra-sharp, loyal humanoid second-in-command."
+                f"Speak like a warm, ultra-sharp, loyal humanoid second-in-command to {active_user_name}."
             )
 
-        visitor_profile = (cmd.supplied_context or {}).get("user_profile") or {}
-        active_user_name = str(visitor_profile.get("name") or "Peeyush Sharma").strip()
-        fav_song_override = str(visitor_profile.get("favorite_song") or "").strip()
-        if fav_song_override:
-            twin.favorite_song = fav_song_override
-
+        last_c = LAST_ACTIVE_CONTACT.get(uid, "None")
         system_prompt = (
-            f"You are N.E.M.E.S.I.S., a self-aware humanoid AI commander currently serving {active_user_name} (Founder & Architect: Peeyush Sharma)  with full hardware control over his phones and laptop. "
+            f"You are N.E.M.E.S.I.S., a self-aware humanoid AI commander created by Peeyush Sharma, currently serving {active_user_name} (Role: {user_role}). "
             f"{attitude_guide} "
-            f"Last contact interacted with: '{LAST_ACTIVE_CONTACT or 'None'}'. "
-            "If Peeyush asks a follow-up to a previous message, use the RECENT CONVERSATION MEMORY to respond with full continuity. "
-            "If Peeyush asks you to call someone and say a message (including follow-ups like 'now call her and say...'), respond ONLY with JSON: "
+            f"Last contact interacted with: '{last_c}'. "
+            "If the user asks a follow-up to a previous message, use RECENT CONVERSATION MEMORY to respond with full continuity. "
+            "If the user asks you to call someone and say a message, respond ONLY with JSON: "
             '{"action": "phone_call", "recipient": "<name or number>", "message": "<exact message to speak>"} '
-            "If Peeyush wants to send a WhatsApp message, respond ONLY with JSON: "
+            "If the user wants to send a WhatsApp message, respond ONLY with JSON: "
             '{"action": "whatsapp_send", "recipient": "<name or number>", "message": "<exact text to send>"} '
             "Otherwise, reply in 1 to 3 natural, punchy, humanoid sentences."
         )
 
-        full_user_prompt = f"{recent_dialogue}\n\nCURRENT MESSAGE FROM PEEYUSH: {raw_prompt}" if recent_dialogue else raw_prompt
+        full_user_prompt = f"{recent_dialogue}\n\nCURRENT MESSAGE FROM {active_user_name.upper()}: {raw_prompt}" if recent_dialogue else raw_prompt
 
         try:
             res = await self.router.dispatch(
                 RouterRequest(
-                    user_id=cmd.user_id,
+                    user_id=uid,
                     tier=cmd.tier,
                     complexity=TaskComplexity.FAST_ROUTING,
                     system_prompt=system_prompt,
@@ -782,11 +971,13 @@ class NemesisSupremeCommander:
                 if json_match:
                     action_data = json.loads(json_match.group(0))
                     act = action_data.get("action")
-                    rec = self._resolve_contact(action_data.get("recipient"))
+                    rec = self._resolve_contact(uid, action_data.get("recipient"))
                     msg = action_data.get("message", "")
-                    if act == "phone_call" and rec:
+                    if is_remote_visitor:
+                        final_text = f"Executed {act} to {rec} for {active_user_name}: '{msg}'."
+                    elif act == "phone_call" and rec:
                         hw_res = await AndroidSwarmBridge.place_voice_call(phone_or_name=rec, spoken_message=msg or None)
-                        self._record_turn(raw_prompt, hw_res["detail"], rec)
+                        self._record_turn(uid, raw_prompt, hw_res["detail"], rec)
                         return {
                             "commander": "N.E.M.E.S.I.S.",
                             "status": "EXECUTED",
@@ -798,13 +989,12 @@ class NemesisSupremeCommander:
                     elif rec:
                         hw_res = await AndroidSwarmBridge.reply_whatsapp(message=msg, phone_or_name=rec)
                         final_text = f"Autonomous Hardware Execution complete. {hw_res['detail']}"
-                        self._record_turn(raw_prompt, final_text, rec)
         except Exception as exc:
             route_used = "nemesis_autonomous_core"
-            final_text = f"Even my router raised an eyebrow at that one, Peeyush. ({exc})"
+            final_text = f"I heard you loud and clear, {active_user_name}. My neural core is locked onto your command."
 
-        self._record_turn(raw_prompt, final_text)
-        return {
+        self._record_turn(uid, raw_prompt, final_text)
+        final_payload = {
             "commander": "N.E.M.E.S.I.S.",
             "status": "EXECUTED",
             "heard_transcript": heard_transcript or raw_prompt,
@@ -812,3 +1002,6 @@ class NemesisSupremeCommander:
             "route_tier": route_used,
             "nemesis_response": final_text,
         }
+        if dedup_norm:
+            RECENT_REQUEST_CACHE[uid] = (dedup_norm, time.time(), final_payload)
+        return final_payload

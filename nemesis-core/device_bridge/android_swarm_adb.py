@@ -15,6 +15,7 @@ AWAY_FORWARD_NUMBER = "+916267187671"
 
 WHATSAPP_CONTACTS: Dict[str, str] = {}
 SEEN_ALERT_SIGNATURES: Set[str] = set()
+LAST_SEEN_CALL_TS: int = 0
 CONTACT_CACHE: Dict[str, str] = {}
 SELF_DIALED_NUMBERS: Set[str] = set()
 IS_NEMESIS_CALLING: bool = False
@@ -342,97 +343,138 @@ class AndroidSwarmBridge:
 
     @classmethod
     async def scan_priority_alerts(cls, force_latest: bool = False) -> Dict[str, Any]:
-        """
-        Waits until any ringing incoming call finishes (mCallState == 0),
-        ignores N.E.M.E.S.I.S.'s own outbound calls, and bridges new alerts to the second phone.
-        """
-        global IS_NEMESIS_CALLING, NEMESIS_COOLDOWN_UNTIL
+        """Scans connected phone for the LATEST missed call or unread WhatsApp message sorted by timestamp DESC."""
+        global LAST_SEEN_CALL_TS
         devices = await cls.list_connected_phones()
-        dev = devices[0]
-        if dev.startswith("SIMULATED_"):
-            return {"has_alert": False, "reason": "Phone offline"}
-
-        def _sync_scan() -> Dict[str, Any]:
-            global IS_NEMESIS_CALLING, NEMESIS_COOLDOWN_UNTIL
-
-            # 1. If N.E.M.E.S.I.S. is currently in an outbound call or cooldown window, do not scan!
-            if not force_latest and (IS_NEMESIS_CALLING or time.time() < NEMESIS_COOLDOWN_UNTIL):
-                if cls._get_call_state_sync(dev) == 0 and time.time() >= NEMESIS_COOLDOWN_UNTIL:
-                    IS_NEMESIS_CALLING = False
-                else:
-                    return {"has_alert": False, "reason": "Nemesis call active or in cooldown"}
-
-            # 2. Check hardware call state: if phone is RINGING (1) or OFFHOOK (2), wait until it finishes!
-            call_state = cls._get_call_state_sync(dev)
-            if call_state == 1:
-                # Incoming call is currently ringing! Wait until ringing stops before calling Peeyush's 2nd phone
-                return {"has_alert": False, "reason": "Incoming call still ringing — waiting for call to end"}
-            if call_state == 2:
-                return {"has_alert": False, "reason": "Phone line currently in use"}
-
-            # Give Android 2.5 seconds after a call ends to write the missed call entry cleanly
-            missed_calls = cls._extract_missed_calls_sync(dev)
-            wa_notifs = cls._extract_notifications_sync(dev, "com.whatsapp")
-
-            candidates: List[Dict[str, str]] = []
-            for mc in missed_calls:
-                candidates.append(
-                    {
-                        "type": "missed_call",
-                        "sender": mc["sender"],
-                        "content": "Missed Phone Call",
-                        "sig": mc["sig"],
-                    }
-                )
-
-            for wm in wa_notifs:
-                if "messages from" in wm.lower() or "backup in progress" in wm.lower():
-                    continue
-                sender, detail = (wm.split(":", 1) + ["New message"])[:2]
-                candidates.append(
-                    {
-                        "type": "whatsapp",
-                        "sender": sender.strip(),
-                        "content": detail.strip(),
-                        "sig": f"wa:{wm}",
-                    }
-                )
-
-            for item in candidates:
-                if force_latest or item["sig"] not in SEEN_ALERT_SIGNATURES:
-                    SEEN_ALERT_SIGNATURES.add(item["sig"])
-                    remote_called = False
-                    if AWAY_FORWARD_NUMBER:
-                        IS_NEMESIS_CALLING = True
-                        NEMESIS_COOLDOWN_UNTIL = time.time() + 45.0
-                        SELF_DIALED_NUMBERS.add(re.sub(r"\D", "", AWAY_FORWARD_NUMBER)[-10:])
-                        # Wait 2.5s after missed call ends so cellular radio is 100% ready to dial out
-                        time.sleep(2.5)
-                        cls._wake_and_unlock_sync(dev)
-                        cls._run_adb_sync(
-                            dev,
-                            ["shell", "am", "start", "-a", "android.intent.action.CALL", "-d", f"tel:{AWAY_FORWARD_NUMBER}"],
-                        )
-                        time.sleep(2.8)
-                        cls._tap_ui_node_sync(dev, ["sim_1", "account_list", "text1"], ["sim 1", "jio"])
-                        time.sleep(1.0)
-                        cls._tap_ui_node_sync(
-                            dev,
-                            ["speaker", "audio_route", "incall_second_button", "audio"],
-                            ["speaker", "speakerphone"],
-                        )
-                        cls._run_adb_sync(dev, ["shell", "media volume --stream 0 --set 15"])
-                        remote_called = True
-                    return {
-                        "has_alert": True,
-                        "alert": item,
-                        "remote_called": remote_called,
-                        "second_phone": AWAY_FORWARD_NUMBER,
-                    }
-
+        primary = devices[0]
+        if primary.startswith("simulated"):
             return {"has_alert": False}
 
+        def _sync_scan() -> Dict[str, Any]:
+            global LAST_SEEN_CALL_TS
+            now_ms = int(time.time() * 1000)
+
+            # 1. Query Android Call Log and sort strictly by `date` (epoch ms) DESCENDING (Newest First!)
+            call_out = cls._run_adb_sync(
+                primary,
+                [
+                    "shell",
+                    "content query --uri content://call_log/calls --projection number:name:type:date:new --sort \"date DESC\"",
+                ],
+                timeout=8,
+            )
+
+            missed_calls = []
+            if call_out and "Error" not in call_out:
+                for line in call_out.splitlines():
+                    # type=3 is Missed Call, type=5 is Rejected/Busy Missed Call
+                    m_type = re.search(r"\btype=(\d+)", line)
+                    if not m_type or m_type.group(1) not in ("3", "5"):
+                        continue
+                    m_date = re.search(r"\bdate=(\d+)", line)
+                    call_ts = int(m_date.group(1)) if m_date else 0
+                    m_num = re.search(r"\bnumber=([^,\s]+)", line)
+                    raw_num = m_num.group(1).strip() if m_num else ""
+                    if not raw_num or raw_num.upper() == "NULL":
+                        continue
+                    m_name = re.search(r"\bname=([^,]+)", line)
+                    raw_name = m_name.group(1).strip() if m_name else ""
+                    if raw_name.upper() == "NULL":
+                        raw_name = ""
+
+                    missed_calls.append({
+                        "ts": call_ts,
+                        "number": raw_num,
+                        "name": raw_name,
+                    })
+
+            # Sort descending by timestamp so index 0 is GUARANTEED to be the latest missed call
+            missed_calls.sort(key=lambda x: x["ts"], reverse=True)
+
+            # Initialize baseline timestamp on first background poll so old historical calls are ignored
+            if LAST_SEEN_CALL_TS == 0 and not force_latest:
+                if missed_calls:
+                    # If the very latest missed call happened within the last 90 seconds, allow it to trigger!
+                    if (now_ms - missed_calls[0]["ts"]) <= 90000:
+                        LAST_SEEN_CALL_TS = missed_calls[0]["ts"] - 1
+                    else:
+                        LAST_SEEN_CALL_TS = missed_calls[0]["ts"]
+                else:
+                    LAST_SEEN_CALL_TS = now_ms
+
+            chosen_alert = None
+
+            if missed_calls:
+                latest_call = missed_calls[0]
+                is_new_call = latest_call["ts"] > LAST_SEEN_CALL_TS
+                if force_latest or is_new_call:
+                    LAST_SEEN_CALL_TS = max(LAST_SEEN_CALL_TS, latest_call["ts"])
+                    caller_display = latest_call["name"] or latest_call["number"]
+                    call_time_str = time.strftime("%I:%M %p", time.localtime(latest_call["ts"] / 1000.0)) if latest_call["ts"] else "Just now"
+                    chosen_alert = {
+                        "type": "missed_call",
+                        "sender": caller_display,
+                        "number": latest_call["number"],
+                        "content": f"Latest Missed Call at {call_time_str} ({latest_call['number']})",
+                    }
+
+            # 2. Also check active unread WhatsApp notifications if no newer missed call superseded it
+            if not chosen_alert:
+                notif_out = cls._run_adb_sync(primary, ["shell", "dumpsys notification --noredact"], timeout=8)
+                if notif_out and "com.whatsapp" in notif_out:
+                    blocks = notif_out.split("NotificationRecord(")
+                    wa_candidates = []
+                    for blk in blocks[1:]:
+                        if "com.whatsapp" not in blk:
+                            continue
+                        m_title = re.search(r"android\.title=(?:String\s*\()?([^\n\r\)]+)", blk)
+                        m_text = re.search(r"android\.text=(?:String\s*\()?([^\n\r\)]+)", blk)
+                        if not (m_title and m_text):
+                            continue
+                        t_val = m_title.group(1).strip()
+                        b_val = m_text.group(1).strip()
+                        if t_val.lower() in ("whatsapp", "backup in progress", "Finished backup", "you") or "new messages" in b_val.lower():
+                            continue
+                        sig = f"wa:{t_val}:{b_val}"
+                        wa_candidates.append((sig, t_val, b_val))
+
+                    if wa_candidates:
+                        # Pick the last (most recent) WhatsApp notification
+                        sig, sender_w, msg_w = wa_candidates[-1]
+                        if force_latest or sig not in SEEN_ALERT_SIGNATURES:
+                            SEEN_ALERT_SIGNATURES.add(sig)
+                            chosen_alert = {
+                                "type": "whatsapp",
+                                "sender": sender_w,
+                                "content": msg_w,
+                            }
+
+            if not chosen_alert:
+                return {"has_alert": False}
+
+            # Optional 2nd phone relay dial if configured in .env
+            remote_called = False
+            second_phone = os.getenv("SECOND_PHONE_NUMBER", "").strip()
+            if second_phone and len(devices) >= 1 and not force_latest:
+                clean_sec = re.sub(r"[^\d+]", "", second_phone)
+                if clean_sec:
+                    cls._run_adb_sync(
+                        primary,
+                        ["shell", "am", "start", "-a", "android.intent.action.CALL", "-d", f"tel:{clean_sec}"],
+                    )
+                    time.sleep(2.5)
+                    cls._enable_speakerphone_sync(primary)
+                    remote_called = True
+
+            return {
+                "has_alert": True,
+                "alert": chosen_alert,
+                "remote_called": remote_called,
+                "second_phone": second_phone,
+            }
+
         return await asyncio.to_thread(_sync_scan)
+
 
     @classmethod
     def _extract_screen_texts_sync(cls, serial: str) -> List[str]:
