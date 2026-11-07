@@ -4,3 +4,10 @@ httpx
 pydantic
 python-dotenv
 python-multipart
+PyJWT
+cryptography
+requests
+beautifulsoup4
+aiofiles
+psutil
+websockets
