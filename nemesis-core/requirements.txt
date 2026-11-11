@@ -1,6 +1,6 @@
 PyJWT
 aiofiles
-argon2
+argon2-cffi
 beautifulsoup4
 cryptography
 fastapi
