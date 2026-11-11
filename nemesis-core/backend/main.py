@@ -7,7 +7,7 @@ os.environ.setdefault("FOUNDER_GOD_KEY", "NEMESIS-GOD-KEY-987")
 os.environ.setdefault("X_FOUNDER_GOD_KEY", "NEMESIS-GOD-KEY-987")
 os.environ.setdefault("NEMESIS_JWT_SECRET", "nemesis-supreme-jwt-secret-2026")
 
-﻿import re
+import re
 import os
 from pathlib import Path
 from typing import Any, Dict
