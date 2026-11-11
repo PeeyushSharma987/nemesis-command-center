@@ -614,3 +614,73 @@ while True:
         headers={"Content-Disposition": 'attachment; filename="NEMESIS_Device_Bridge_Kit.zip"'},
     )
 
+
+# --- LIVE AI & VISION FALLBACK INTERCEPTOR ---
+from starlette.responses import Response
+from backend.cloud_ai_fallback import ask_nemesis_ai, analyze_nemesis_image
+
+
+@app.middleware("http")
+async def nemesis_ai_and_vision_interceptor(request: Request, call_next):
+    body_bytes = await request.body()
+
+    async def _receive():
+        return {"type": "http.request", "body": body_bytes, "more_body": False}
+
+    request._receive = _receive
+    response = await call_next(request)
+
+    ct = (response.headers.get("content-type") or "").lower()
+    if "application/json" not in ct:
+        return response
+
+    resp_bytes = b""
+    async for chunk in response.body_iterator:
+        resp_bytes += chunk
+
+    try:
+        resp_text = resp_bytes.decode("utf-8")
+        modified = False
+
+        # 1. Intercept "Gemini API key missing" on SCAN SCENE / Vision uploads
+        if "Gemini API key missing" in resp_text:
+            jpg_start = body_bytes.find(b"\xff\xd8\xff")
+            jpg_end = body_bytes.rfind(b"\xff\xd9")
+            img_slice = body_bytes[jpg_start:jpg_end + 2] if (jpg_start != -1 and jpg_end != -1) else b""
+            vision_res = await analyze_nemesis_image(img_slice)
+            data = json.loads(resp_text)
+            for k in list(data.keys()):
+                if isinstance(data[k], str) and "Gemini API key missing" in data[k]:
+                    data[k] = vision_res
+            resp_bytes = json.dumps(data).encode("utf-8")
+            modified = True
+
+        # 2. Intercept generic canned fallback on typed/spoken commands
+        elif "My neural core is locked onto your command" in resp_text:
+            req_json = json.loads(body_bytes.decode("utf-8", errors="ignore") or "{}")
+            user_cmd = (
+                req_json.get("raw_command")
+                or req_json.get("command")
+                or req_json.get("prompt")
+                or ""
+            ).strip()
+            ctx = req_json.get("supplied_context") or {}
+            u_name = ctx.get("user_name") or "PEEYUSH SHARMA"
+            if user_cmd and user_cmd != "__SENTINEL_SCAN__":
+                ai_reply = await ask_nemesis_ai(user_cmd, user_name=u_name)
+                data = json.loads(resp_text)
+                for k in ("nemesis_response", "response", "message", "detail"):
+                    if isinstance(data.get(k), str) and "My neural core is locked onto your command" in data[k]:
+                        data[k] = ai_reply
+                resp_bytes = json.dumps(data).encode("utf-8")
+                modified = True
+    except Exception:
+        pass
+
+    new_headers = {k: v for k, v in response.headers.items() if k.lower() != "content-length"}
+    return Response(
+        content=resp_bytes,
+        status_code=response.status_code,
+        headers=new_headers,
+        media_type=response.media_type,
+    )
