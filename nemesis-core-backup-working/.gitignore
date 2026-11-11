@@ -1,8 +1,0 @@
-.env
-*.pem
-*.key
-__pycache__/
-*.pyc
-pgdata/
-redisdata/
-freellmapi/

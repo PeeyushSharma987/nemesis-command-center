@@ -1,3 +1,12 @@
+import os, sys, re
+from pathlib import Path
+_CORE_ROOT = str(Path(__file__).resolve().parent.parent)
+if _CORE_ROOT not in sys.path:
+    sys.path.insert(0, _CORE_ROOT)
+os.environ.setdefault("FOUNDER_GOD_KEY", "NEMESIS-GOD-KEY-987")
+os.environ.setdefault("X_FOUNDER_GOD_KEY", "NEMESIS-GOD-KEY-987")
+os.environ.setdefault("NEMESIS_JWT_SECRET", "nemesis-supreme-jwt-secret-2026")
+
 ﻿import re
 import os
 from pathlib import Path
