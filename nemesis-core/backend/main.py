@@ -407,7 +407,8 @@ async def download_device_bridge_kit(server_url: str = "http://localhost:8000", 
         "====================================================================\r\n"
     )
 
-    bridge_py_template = r"""import json
+    bridge_py_template = r"""import getpass
+import json
 import re
 import shutil
 import subprocess
@@ -421,12 +422,25 @@ SERVER_URL = "__SERVER_URL__"
 USER_ID = "__USER_ID__"
 HERE = Path(__file__).resolve().parent
 LOCAL_ADB = HERE / "platform-tools" / "adb.exe"
+PIN_CACHE_FILE = HERE / ".phone_pin_cache"
 
 print("=================================================================")
-print("  N.E.M.E.S.I.S. v3.5 - REAL-TIME TELEMETRY & HARDWARE BRIDGE")
+print("  N.E.M.E.S.I.S. v3.6 - ZERO-RESET TELEMETRY & PIN UNLOCK BRIDGE")
 print("  Personal Profile ID : " + USER_ID)
 print("  Connected Web Core  : " + SERVER_URL)
 print("=================================================================")
+
+PHONE_PIN = ""
+if PIN_CACHE_FILE.exists():
+    PHONE_PIN = PIN_CACHE_FILE.read_text(encoding="utf-8", errors="ignore").strip()
+
+user_pin_input = input("[SETUP] Enter your phone lockscreen PIN/Password for Auto-Unlock (or press Enter to keep saved): ").strip()
+if user_pin_input:
+    PHONE_PIN = user_pin_input
+    try:
+        PIN_CACHE_FILE.write_text(PHONE_PIN, encoding="utf-8")
+    except Exception:
+        pass
 
 def ensure_adb():
     if LOCAL_ADB.exists():
@@ -455,25 +469,43 @@ def run_adb(dev, args, timeout=6):
     except Exception:
         return ""
 
-def collect_telemetry(dev, include_contacts=False):
+def unlock_phone_screen(dev):
+    run_adb(dev, ["shell", "input", "keyevent", "224"])
+    time.sleep(0.4)
+    run_adb(dev, ["shell", "wm", "dismiss-keyguard"])
+    run_adb(dev, ["shell", "input", "swipe", "600", "2000", "600", "400", "300"])
+    if PHONE_PIN:
+        time.sleep(0.9)
+        run_adb(dev, ["shell", "input", "text", PHONE_PIN])
+        time.sleep(0.2)
+        run_adb(dev, ["shell", "input", "keyevent", "66"])
+
+def collect_telemetry(dev, include_contacts=False, contacts_store=None):
+    if contacts_store is None:
+        contacts_store = {}
     model = run_adb(dev, ["shell", "getprop", "ro.product.model"], timeout=4)
     call_out = run_adb(dev, ["shell", 'content query --uri content://call_log/calls --projection number:name:type:date --sort "date DESC"'], timeout=6)
     missed = []
     for line in call_out.splitlines():
-        m_t = re.search(r"\btype=(\d+)", line)
-        if not m_t or m_t.group(1) not in ("3", "5"):
-            continue
-        m_d = re.search(r"\bdate=(\d+)", line)
-        ts = int(m_d.group(1)) if m_d else 0
         m_num = re.search(r"\bnumber=([^,\s]+)", line)
         num = m_num.group(1).strip() if m_num else ""
-        if not num or num.upper() == "NULL":
-            continue
         m_name = re.search(r"\bname=([^,]+)", line)
         name = m_name.group(1).strip() if m_name else ""
         if name.upper() == "NULL":
             name = ""
+        if name and num and num.upper() != "NULL":
+            dg = re.sub(r"\D", "", num)
+            if len(dg) >= 10:
+                contacts_store[name.lower()] = "91" + dg[-10:]
+        m_t = re.search(r"\btype=(\d+)", line)
+        if not m_t or m_t.group(1) not in ("3", "5"):
+            continue
+        if not num or num.upper() == "NULL":
+            continue
+        m_d = re.search(r"\bdate=(\d+)", line)
+        ts = int(m_d.group(1)) if m_d else 0
         missed.append({"ts": ts, "number": num, "name": name})
+
     missed.sort(key=lambda x: x["ts"], reverse=True)
     latest_call = None
     if missed:
@@ -500,7 +532,6 @@ def collect_telemetry(dev, include_contacts=False):
                 if sv.lower() not in ("whatsapp", "you", "backup in progress") and "new messages" not in bv.lower():
                     wa_list.append({"sender": sv, "content": bv})
 
-    contacts_map = {}
     if include_contacts:
         c_out = run_adb(dev, ["shell", "content query --uri content://com.android.contacts/data/phones --projection display_name:data1"], timeout=8)
         for line in c_out.splitlines():
@@ -510,27 +541,43 @@ def collect_telemetry(dev, include_contacts=False):
                 dn = mn.group(1).strip().lower()
                 dg = re.sub(r"\D", "", mp.group(1))
                 if len(dg) >= 10:
-                    contacts_map[dn] = "91" + dg[-10:]
+                    contacts_store[dn] = "91" + dg[-10:]
 
-    return model, latest_call, wa_list[-5:], contacts_map
+    return model, latest_call, wa_list[-5:], contacts_store
 
-def execute_remote_action(dev, cmd_obj):
+def resolve_number_on_phone(dev, raw_target, contacts_store):
+    raw_str = (raw_target or "").strip()
+    digits = re.sub(r"\D", "", raw_str)
+    if len(digits) >= 10:
+        return "+91" + digits[-10:]
+    key = raw_str.lower()
+    if key in contacts_store:
+        return "+" + contacts_store[key].lstrip("+")
+    for k, v in contacts_store.items():
+        if key and (key in k or k in key):
+            return "+" + v.lstrip("+")
+    return digits or raw_str
+
+def execute_remote_action(dev, cmd_obj, contacts_store):
     act = cmd_obj.get("action")
     pay = cmd_obj.get("payload", {})
     print("\n[EXECUTING N.E.M.E.S.I.S. COMMAND ON YOUR PHONE]: " + str(act) + " -> " + str(pay))
 
     if act == "unlock":
-        run_adb(dev, ["shell", "input", "keyevent", "224"])
-        run_adb(dev, ["shell", "input", "swipe", "500", "1600", "500", "400", "300"])
+        unlock_phone_screen(dev)
     elif act == "hangup":
         run_adb(dev, ["shell", "input", "keyevent", "KEYCODE_ENDCALL"])
     elif act == "play_song":
+        unlock_phone_screen(dev)
         q = urllib.parse.quote(pay.get("query", "Cyberpunk Synthwave"))
         run_adb(dev, ["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", "https://www.youtube.com/results?search_query=" + q])
     elif act == "phone_call":
-        target = pay.get("number") or ""
+        unlock_phone_screen(dev)
+        time.sleep(0.5)
+        dial_num = resolve_number_on_phone(dev, pay.get("number") or "", contacts_store)
         msg = pay.get("message") or ""
-        run_adb(dev, ["shell", "am", "start", "-a", "android.intent.action.CALL", "-d", "tel:+" + target])
+        print("[DIALING NUMBER]: " + str(dial_num))
+        run_adb(dev, ["shell", "am", "start", "-a", "android.intent.action.CALL", "-d", "tel:" + dial_num])
         time.sleep(2.5)
         run_adb(dev, ["shell", "cmd", "audio", "set-communication-device", "2"])
         if msg:
@@ -539,10 +586,11 @@ def execute_remote_action(dev, cmd_obj):
             ps_tts = "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Rate = 0; $s.Speak('Hello, I am Nemesis. " + clean_m + "')"
             subprocess.run(["powershell", "-NoProfile", "-Command", ps_tts], timeout=20)
     elif act == "whatsapp_send":
-        target = pay.get("number") or ""
+        unlock_phone_screen(dev)
+        dial_num = resolve_number_on_phone(dev, pay.get("number") or "", contacts_store).lstrip("+")
         msg = pay.get("message") or ""
         enc = urllib.parse.quote(msg)
-        run_adb(dev, ["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", "https://api.whatsapp.com/send?phone=" + target + "&text=" + enc])
+        run_adb(dev, ["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", "https://api.whatsapp.com/send?phone=" + dial_num + "&text=" + enc])
         time.sleep(3.5)
         run_adb(dev, ["shell", "input", "keyevent", "22"])
         run_adb(dev, ["shell", "input", "keyevent", "66"])
@@ -550,6 +598,8 @@ def execute_remote_action(dev, cmd_obj):
 
 wireless_target = ""
 contacts_synced = False
+tcpip_attempted = set()
+contacts_cache = {}
 
 while True:
     try:
@@ -559,20 +609,37 @@ while True:
         devs = [l.split()[0] for l in out.splitlines()[1:] if l.strip() and "\tdevice" in l]
         if devs:
             usb_dev = next((d for d in devs if ":" not in d), None)
-            if usb_dev and not wireless_target:
-                print("[*] USB Phone detected (" + usb_dev + ")! Bridging to Wireless ADB (Port 5555)...")
-                subprocess.run([adb_exe, "-s", usb_dev, "tcpip", "5555"], capture_output=True, text=True, timeout=6)
-                time.sleep(1.8)
-                ip_out = run_adb(usb_dev, ["shell", "ip -f inet addr show wlan0"])
-                m_ip = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", ip_out)
-                if m_ip:
-                    wireless_target = m_ip.group(1) + ":5555"
-                    subprocess.run([adb_exe, "connect", wireless_target], capture_output=True, text=True, timeout=6)
-                    print("[SUCCESS] Wireless ADB established at " + wireless_target + "! You can now unplug your USB cable.")
+            # ONLY attempt USB-to-Wireless tcpip 5555 ONCE per device so Windows File Explorer NEVER loops!
+            if usb_dev and not wireless_target and (usb_dev not in tcpip_attempted):
+                tcpip_attempted.add(usb_dev)
+                print("[*] Attempting one-time Wireless ADB bridge for " + usb_dev + "...")
+                ip_found = ""
+                for iface_cmd in (["shell", "ip -f inet addr show wlan0"], ["shell", "ip route"]):
+                    ip_out = run_adb(usb_dev, iface_cmd)
+                    m_ip = re.search(r"(?:inet|src)\s+(\d+\.\d+\.\d+\.\d+)", ip_out)
+                    if m_ip and not m_ip.group(1).startswith("127."):
+                        ip_found = m_ip.group(1)
+                        break
+                if ip_found:
+                    subprocess.run([adb_exe, "-s", usb_dev, "tcpip", "5555"], capture_output=True, text=True, timeout=6)
+                    time.sleep(2.0)
+                    cand_target = ip_found + ":5555"
+                    c_out = subprocess.run([adb_exe, "connect", cand_target], capture_output=True, text=True, timeout=6)
+                    if "connected" in (c_out.stdout + c_out.stderr).lower():
+                        wireless_target = cand_target
+                        print("[SUCCESS] Wireless ADB established at " + wireless_target + "! You can unplug USB.")
+                    else:
+                        print("[INFO] Using stable direct USB ADB connection (" + usb_dev + ").")
+                else:
+                    print("[INFO] Phone Wi-Fi not on local LAN; using stable direct USB ADB (" + usb_dev + ").")
 
             active_dev = wireless_target if (wireless_target and wireless_target in devs) else devs[0]
-            model, latest_call, wa_list, c_map = collect_telemetry(active_dev, include_contacts=(not contacts_synced))
-            if c_map:
+            model, latest_call, wa_list, contacts_cache = collect_telemetry(
+                active_dev,
+                include_contacts=(not contacts_synced),
+                contacts_store=contacts_cache,
+            )
+            if contacts_cache:
                 contacts_synced = True
 
             hb_payload = {
@@ -582,7 +649,7 @@ while True:
                 "phone_model": model,
                 "latest_missed_call": latest_call,
                 "whatsapp_alerts": wa_list,
-                "contacts": c_map if c_map else None,
+                "contacts": contacts_cache if contacts_cache else None,
             }
             req = urllib.request.Request(
                 SERVER_URL + "/api/v1/bridge/remote-heartbeat",
@@ -593,7 +660,7 @@ while True:
             with urllib.request.urlopen(req, timeout=8) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 for cmd_obj in data.get("commands", []):
-                    execute_remote_action(active_dev, cmd_obj)
+                    execute_remote_action(active_dev, cmd_obj, contacts_cache)
 
             call_info = (" | Latest Missed Call: " + latest_call["sender"]) if latest_call else ""
             print("[ONLINE & SYNCED] " + active_dev + " (" + model + ") -> Profile '" + USER_ID + "'" + call_info)
